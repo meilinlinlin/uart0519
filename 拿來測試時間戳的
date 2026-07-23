@@ -1,0 +1,124 @@
+import sys
+import time
+from datetime import datetime
+
+import serial
+from serial.tools import list_ports
+
+
+# =========================================================
+# 使用者設定
+# =========================================================
+
+# 改成 UART4 所接 USB-to-TTL 的 COM Port
+COM_PORT = "COM10"
+
+# 必須和 STM32 CubeMX 的 UART4 設定相同
+BAUD_RATE = 115200
+
+
+def show_available_ports() -> None:
+    """列出目前電腦偵測到的所有序列埠。"""
+    ports = list(list_ports.comports())
+
+    print("目前可用的 COM Port：")
+
+    if not ports:
+        print("  找不到任何序列埠")
+        return
+
+    for port in ports:
+        print(f"  {port.device}: {port.description}")
+
+
+def open_serial() -> serial.Serial:
+    """開啟 UART4 對應的電腦序列埠。"""
+    ser = serial.Serial(
+        port=COM_PORT,
+        baudrate=BAUD_RATE,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_NONE,
+        stopbits=serial.STOPBITS_ONE,
+        timeout=0.2,
+        write_timeout=1,
+    )
+
+    # 部分 USB-to-TTL 開啟後需要短暫穩定時間
+    time.sleep(1)
+
+    # 清除開啟前殘留的接收資料
+    ser.reset_input_buffer()
+
+    return ser
+
+
+def monitor_uart4(ser: serial.Serial) -> None:
+    """
+    持續監聽 STM32 UART4 傳出的文字。
+
+    STM32 使用 \r\n 結尾，因此可以使用 readline()。
+    """
+    print()
+    print("=" * 60)
+    print(f"UART4 監聽中：{COM_PORT}, {BAUD_RATE} baud")
+    print("目前模式：只接收，不向 STM32 傳送資料")
+    print("按 Ctrl+C 結束")
+    print("=" * 60)
+
+    while True:
+        try:
+            raw_data = ser.readline()
+
+            if not raw_data:
+                continue
+
+            text = raw_data.decode(
+                "utf-8",
+                errors="replace",
+            ).rstrip("\r\n")
+
+            if text:
+                timestamp = datetime.now().strftime(
+                    "%H:%M:%S.%f"
+                )[:-3]
+
+                print(f"[{timestamp}] {text}")
+
+        except serial.SerialException as exc:
+            print(f"\nUART 接收失敗：{exc}")
+            break
+
+
+def main() -> None:
+    show_available_ports()
+
+    try:
+        ser = open_serial()
+
+    except serial.SerialException as exc:
+        print()
+        print(f"無法開啟 {COM_PORT}")
+        print(f"原因：{exc}")
+        print()
+        print("請檢查：")
+        print("1. COM_PORT 是否正確")
+        print("2. USB-to-TTL 是否已連接")
+        print("3. 是否有其他 Serial Monitor 正在占用此 COM Port")
+        print("4. UART4 baud rate 是否為 115200")
+        sys.exit(1)
+
+    try:
+        monitor_uart4(ser)
+
+    except KeyboardInterrupt:
+        print("\n停止 UART4 監聽")
+
+    finally:
+        if ser.is_open:
+            ser.close()
+
+        print(f"{COM_PORT} 已關閉")
+
+
+if __name__ == "__main__":
+    main()
