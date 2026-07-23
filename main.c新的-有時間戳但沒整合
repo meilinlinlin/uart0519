@@ -105,6 +105,33 @@ static uint32_t timing_total_to_lcd_us = 0U;
 static uint32_t timing_sequence = 0U;
 
 static uint8_t timing_first_tx_pending = 0U;
+/* ===== Nano → 發送端 STM32 → IR 實際開始輸出的時間戳 ===== */
+
+/* PC8 上升緣：Nano 開始 YOLO/TensorRT 辨識 */
+static volatile uint32_t timing_nano_start_cycle = 0U;
+
+/* PC8 下降緣：Nano 完成事件與 Level 判定 */
+static volatile uint32_t timing_nano_done_cycle = 0U;
+
+/* UART4 已收到完整事件字元 */
+static volatile uint32_t timing_uart_done_cycle = 0U;
+
+/* PC9 偵測到 PA8 第一個 PWM 上升緣 */
+static volatile uint32_t timing_ir_tx_start_cycle = 0U;
+
+/* 換算完成的各段延遲，單位為 us */
+static uint32_t timing_nano_inference_us = 0U;
+static uint32_t timing_nano_to_uart_us = 0U;
+static volatile uint32_t timing_stm32_to_ir_us = 0U;
+
+/* PC8 是否已收到一組完整的上升緣與下降緣 */
+static volatile uint8_t timing_nano_mark_valid = 0U;
+
+/* UART 事件是否有效，避免開機 SAFE 誤算 */
+static volatile uint8_t timing_uart_event_valid = 0U;
+
+/* 只有新事件第一包 IR 才允許 PC9 記錄 */
+static volatile uint8_t timing_ir_monitor_armed = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -117,6 +144,8 @@ static void UART_Print(const char *msg);
 static void DWT_Delay_Init(void);
 static void delay_us(uint32_t us);
 static uint32_t DWT_ElapsedUs(uint32_t start_cycle);
+static uint32_t DWT_BetweenUs(uint32_t start_cycle,
+                              uint32_t end_cycle);
 
 static void IR_CarrierOn(void);
 static void IR_CarrierOff(void);
@@ -182,6 +211,17 @@ static uint32_t DWT_ElapsedUs(uint32_t start_cycle)
   uint32_t elapsed_cycles;
 
   elapsed_cycles = DWT->CYCCNT - start_cycle;
+
+  return elapsed_cycles /
+         (SystemCoreClock / 1000000U);
+}
+
+static uint32_t DWT_BetweenUs(uint32_t start_cycle,
+                              uint32_t end_cycle)
+{
+  uint32_t elapsed_cycles;
+
+  elapsed_cycles = end_cycle - start_cycle;
 
   return elapsed_cycles /
          (SystemCoreClock / 1000000U);
@@ -444,6 +484,20 @@ static void IR_SendCurrentEvent(void)
    */
   ir_start_cycle = DWT->CYCCNT;
 
+  /*
+   * 新事件第一包發送前，打開 PC9 的 EXTI9。
+   * PC9 接到 PA8，捕捉 PA8 真正出現的第一個 PWM 上升緣。
+   */
+  if (is_first_tx != 0U)
+  {
+    timing_ir_tx_start_cycle = 0U;
+    timing_stm32_to_ir_us = 0U;
+    timing_ir_monitor_armed = 1U;
+
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
+    EXTI->IMR |= GPIO_PIN_9;
+  }
+
   IR_SendStart();
   IR_SendPayload6(payload);
   IR_SendStop();
@@ -469,7 +523,7 @@ static void IR_SendCurrentEvent(void)
 static void Timing_PrintResult(uint8_t event_type,
                                uint8_t level)
 {
-  char log_msg[220];
+  char log_msg[340];
   uint8_t payload;
 
   payload = IR_MakePayload(event_type, level);
@@ -480,12 +534,16 @@ static void Timing_PrintResult(uint8_t event_type,
       log_msg,
       sizeof(log_msg),
       "TIME,SEQ=%lu,TYPE=%u,LEVEL=%u,PAYLOAD=0x%02X,"
-      "WAIT_TO_IR=%lu us,IR_TX=%lu us,LCD=%lu us,"
-      "TOTAL_TO_LCD=%lu us\r\n",
+      "NANO_INFER=%lu us,NANO_TO_UART=%lu us,"
+      "STM32_TO_IR=%lu us,WAIT_TO_IR=%lu us,"
+      "IR_TX=%lu us,LCD=%lu us,TOTAL_TO_LCD=%lu us\r\n",
       (unsigned long)timing_sequence,
       (unsigned int)event_type,
       (unsigned int)level,
       (unsigned int)payload,
+      (unsigned long)timing_nano_inference_us,
+      (unsigned long)timing_nano_to_uart_us,
+      (unsigned long)timing_stm32_to_ir_us,
       (unsigned long)timing_ir_wait_us,
       (unsigned long)timing_ir_tx_us,
       (unsigned long)timing_lcd_us,
@@ -493,6 +551,10 @@ static void Timing_PrintResult(uint8_t event_type,
   );
 
   UART_Print(log_msg);
+
+  /* 避免下一筆非 Nano 指令沿用上一筆標記 */
+  timing_nano_mark_valid = 0U;
+  timing_uart_event_valid = 0U;
 }
 static void Set_Event(uint8_t event_type,
                       uint8_t level)
@@ -568,6 +630,26 @@ static void Check_UART_Command(void)
     return;
   }
 
+  /* UART4 已收到完整事件字元 */
+  timing_uart_done_cycle = DWT->CYCCNT;
+  timing_uart_event_valid = 1U;
+
+  if (timing_nano_mark_valid != 0U)
+  {
+    timing_nano_inference_us =
+        DWT_BetweenUs(timing_nano_start_cycle,
+                      timing_nano_done_cycle);
+
+    timing_nano_to_uart_us =
+        DWT_BetweenUs(timing_nano_done_cycle,
+                      timing_uart_done_cycle);
+  }
+  else
+  {
+    timing_nano_inference_us = 0U;
+    timing_nano_to_uart_us = 0U;
+  }
+
   switch (rx_data)
   {
     case '0':
@@ -575,6 +657,7 @@ static void Check_UART_Command(void)
                 IR_LEVEL_NONE);
 
       //UART_Print("\r\nCMD 0: SAFE\r\n");
+
       break;
 
     case '1':
@@ -582,6 +665,7 @@ static void Check_UART_Command(void)
                 IR_LEVEL_1);
 
       //UART_Print("\r\nCMD 1: VRU Level 1\r\n");
+
       break;
 
     case '2':
@@ -589,6 +673,7 @@ static void Check_UART_Command(void)
                 IR_LEVEL_2);
 
       //UART_Print("\r\nCMD 2: VRU Level 2\r\n");
+
       break;
 
     case '3':
@@ -596,12 +681,14 @@ static void Check_UART_Command(void)
                 IR_LEVEL_3);
 
       //UART_Print("\r\nCMD 3: VRU Level 3\r\n");
+
       break;
       case '4':
       Set_Event(IR_TYPE_BRAKE,
                 IR_LEVEL_1);
 
       //UART_Print("\r\nCMD 4: BRAKE Level 1\r\n");
+
       break;
 
     case '5':
@@ -609,6 +696,7 @@ static void Check_UART_Command(void)
                 IR_LEVEL_2);
 
       //UART_Print("\r\nCMD 5: BRAKE Level 2\r\n");
+
       break;
 
     case '6':
@@ -616,6 +704,7 @@ static void Check_UART_Command(void)
                 IR_LEVEL_3);
 
       //UART_Print("\r\nCMD 6: BRAKE Level 3\r\n");
+
       break;
 
     case 'E':
@@ -624,6 +713,7 @@ static void Check_UART_Command(void)
                 IR_LEVEL_NONE);
 
       //UART_Print("\r\nCMD E: SYSTEM ERROR\r\n");
+
       break;
 
     case '\r':
@@ -663,6 +753,7 @@ if ((current_event_type == IR_TYPE_NONE) &&
     force_send_now = 0U;
 
     //UART_Print("TX SAFE 00000000\r\n");
+
   }
 
   return;
@@ -747,6 +838,13 @@ HAL_Delay(100);
  * NEC 紅外線時序需要 us 等級延遲。
  */
 DWT_Delay_Init();
+
+/*
+ * PC9 只在新事件第一包發送前才開啟。
+ * 先遮罩 EXTI9，避免待機期間被其他邊緣觸發。
+ */
+EXTI->IMR &= ~GPIO_PIN_9;
+__HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
 
 /*
  * 啟動 TIM1 Channel 1 PWM。
@@ -858,6 +956,58 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  uint32_t now_cycle;
+
+  now_cycle = DWT->CYCCNT;
+
+  /* PC8：Nano 辨識開始／完成標記，使用雙邊緣中斷 */
+  if (GPIO_Pin == GPIO_PIN_8)
+  {
+    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_8) == GPIO_PIN_SET)
+    {
+      /* 上升緣：Nano 開始辨識 */
+      timing_nano_start_cycle = now_cycle;
+      timing_nano_mark_valid = 0U;
+    }
+    else
+    {
+      /* 下降緣：Nano 完成事件與 Level 判定 */
+      timing_nano_done_cycle = now_cycle;
+      timing_nano_mark_valid = 1U;
+    }
+
+    return;
+  }
+
+  /* PC9：監看 PA8，僅記錄新事件第一包的第一個 PWM 上升緣 */
+  if (GPIO_Pin == GPIO_PIN_9)
+  {
+    if (timing_ir_monitor_armed != 0U)
+    {
+      timing_ir_tx_start_cycle = now_cycle;
+
+      if (timing_uart_event_valid != 0U)
+      {
+        timing_stm32_to_ir_us =
+            DWT_BetweenUs(timing_uart_done_cycle,
+                          timing_ir_tx_start_cycle);
+      }
+      else
+      {
+        timing_stm32_to_ir_us = 0U;
+      }
+
+      timing_ir_monitor_armed = 0U;
+
+      /* 抓到第一個邊緣後遮罩 EXTI9，避免 38 kHz 持續中斷 */
+      EXTI->IMR &= ~GPIO_PIN_9;
+    }
+
+    return;
+  }
+}
 
 /* USER CODE END 4 */
 
