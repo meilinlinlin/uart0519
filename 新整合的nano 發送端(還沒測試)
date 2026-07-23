@@ -1,0 +1,1146 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "dma.h"
+#include "i2c.h"
+#include "spi.h"
+#include "tim.h"
+#include "usart.h"
+#include "usb_host.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "ili9341.h"
+#include "lcd.h"
+#include <stdio.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* ===== Nano 傳給 STM32 的 4-bit 事件編碼 ===== */
+/* Nano 實際傳送一個原始 Byte，事件碼放在低四位 */
+#define NANO_CODE_SAFE       0x00U  /* 0000 */
+#define NANO_CODE_LEVEL_1    0x05U  /* 0101 */
+#define NANO_CODE_LEVEL_2    0x06U  /* 0110 */
+#define NANO_CODE_LEVEL_3    0x07U  /* 0111 */
+/* ===== NEC timing ===== */
+#define IR_START_ON_US             9000U
+#define IR_START_OFF_US            4500U
+#define IR_BIT_MARK_US             562U
+#define IR_ZERO_SPACE_US           562U
+#define IR_ONE_SPACE_US            1687U
+#define IR_STOP_MARK_US            562U
+
+/* ===== Send strategy ===== */
+
+#define IR_SAFE_PERIOD_MS       120U
+#define IR_EVENT_PERIOD_MS         150U
+#define IR_ERROR_PERIOD_MS         300U
+#define IR_MAIN_LOOP_DELAY_MS      5U
+
+#define IR_PWM_DUTY                26U
+
+/* ===== Event type：2 bit ===== */
+#define IR_TYPE_NONE               0x00U  /* 00：安全 */
+#define IR_TYPE_VRU_CROSS          0x01U  /* 01：弱勢用路人穿越 */
+#define IR_TYPE_BRAKE              0x02U  /* 10：前前車緊急煞車 */
+#define IR_TYPE_ERROR              0x03U  /* 11：系統錯誤 */
+
+/* ===== Warning level ===== */
+#define IR_LEVEL_NONE              0x00U
+#define IR_LEVEL_1                 0x01U
+#define IR_LEVEL_2                 0x02U
+#define IR_LEVEL_3                 0x03U
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+static uint8_t current_event_type = IR_TYPE_NONE;
+static uint8_t current_level = IR_LEVEL_NONE;
+
+
+static uint32_t last_send_tick = 0U;
+static uint8_t force_send_now = 0U;
+
+/* 避免相同事件重複刷新 LCD */
+static uint8_t lcd_last_event_type = 0xFFU;
+static uint8_t lcd_last_level = 0xFFU;
+/* ===== 精準延遲量測變數 ===== */
+/*
+ * 量測方式：
+ * 1. Nano 的計時 GPIO 接到 STM32 PC8。
+ *    上升緣 = Nano 開始辨識；下降緣 = Nano 完成事件判定、準備送 UART。
+ * 2. USART2 使用接收完成中斷，收到完整 Byte 時立即記錄時間。
+ * 3. PA8（IR PWM）以跳線接到 PC9，PC9 捕捉第一個實際 PWM 上升緣。
+ */
+
+/* Nano PC8 標記的最新一組時間（由 EXTI 中斷更新） */
+static volatile uint32_t nano_marker_start_cycle = 0U;
+static volatile uint32_t nano_marker_done_cycle = 0U;
+static volatile uint8_t nano_marker_valid = 0U;
+
+/* USART2 中斷每次接收一個 Nano 原始 Byte */
+static uint8_t nano_rx_byte = 0U;
+
+/* ISR 暫存一筆待處理事件；Nano 建議只在事件改變時送出 */
+static volatile uint8_t nano_event_pending = 0U;
+static volatile uint8_t nano_pending_code = 0U;
+static volatile uint32_t nano_pending_uart_cycle = 0U;
+static volatile uint32_t nano_pending_start_cycle = 0U;
+static volatile uint32_t nano_pending_done_cycle = 0U;
+static volatile uint8_t nano_pending_marker_valid = 0U;
+static volatile uint32_t nano_dropped_count = 0U;
+
+/* 目前正在處理的事件時間戳 */
+static volatile uint32_t timing_event_start_cycle = 0U;
+static volatile uint32_t timing_uart_done_cycle = 0U;
+static volatile uint32_t timing_nano_start_cycle = 0U;
+static volatile uint32_t timing_nano_done_cycle = 0U;
+static volatile uint32_t timing_ir_tx_start_cycle = 0U;
+
+/* 目前事件的來源資訊 */
+static uint8_t timing_rx_code = 0U;
+static uint8_t timing_uart_event_valid = 0U;
+static uint8_t timing_nano_mark_valid = 0U;
+
+/* 各段量測結果，單位 us */
+static uint32_t timing_nano_inference_us = 0U;
+static uint32_t timing_nano_to_uart_us = 0U;
+static uint32_t timing_uart_to_process_us = 0U;
+static volatile uint32_t timing_ir_wait_us = 0U;       /* Set_Event → 實際 IR */
+static volatile uint32_t timing_stm32_to_ir_us = 0U;   /* UART 收完 → 實際 IR */
+static volatile uint32_t timing_nano_done_to_ir_us = 0U;
+static volatile uint32_t timing_nano_start_to_ir_us = 0U;
+static uint32_t timing_ir_tx_us = 0U;
+static uint32_t timing_lcd_us = 0U;
+static uint32_t timing_total_to_lcd_us = 0U;            /* Set_Event → LCD 完成 */
+static uint32_t timing_uart_to_lcd_us = 0U;
+static uint32_t timing_nano_done_to_lcd_us = 0U;
+static uint32_t timing_nano_start_to_lcd_us = 0U;
+
+/* 每次有效事件的流水編號 */
+static uint32_t timing_sequence = 0U;
+
+/* 只量測新事件第一包 IR */
+static uint8_t timing_first_tx_pending = 0U;
+static volatile uint8_t timing_ir_monitor_armed = 0U;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+void MX_USB_HOST_Process(void);
+
+/* USER CODE BEGIN PFP */
+static void UART_Print(const char *msg);
+
+static void DWT_Delay_Init(void);
+static void delay_us(uint32_t us);
+static uint32_t DWT_ElapsedUs(uint32_t start_cycle);
+static uint32_t DWT_BetweenUs(uint32_t start_cycle,
+                              uint32_t end_cycle);
+
+static void IR_CarrierOn(void);
+static void IR_CarrierOff(void);
+static void IR_SendStart(void);
+static void IR_SendBit(uint8_t bitValue);
+static void IR_SendStop(void);
+static uint8_t IR_CalculateCRC2(uint8_t data4);
+static uint8_t IR_MakePayload(uint8_t event_type, uint8_t level);
+static void IR_SendPayload6(uint8_t payload);
+static void IR_SendCurrentEvent(void);
+static void IR_Process(void);
+
+static void LCD_UpdateEvent(uint8_t event_type, uint8_t level);
+static void Timing_PrintResult(uint8_t event_type, uint8_t level);
+static void Set_Event(uint8_t event_type, uint8_t level);
+static void Process_Nano_Event(void);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+static void UART_Print(const char *msg)
+{
+  uint16_t len = 0U;
+
+  while (msg[len] != '\0')
+  {
+    len++;
+  }
+
+  HAL_UART_Transmit(&huart4,
+                    (uint8_t *)msg,
+                    len,
+                    HAL_MAX_DELAY);
+}
+
+/*
+ * STM32F407 Cortex-M4 DWT 微秒延遲。
+ * NEC 時序需要 us 等級，不能使用 HAL_Delay() 取代。
+ */
+static void DWT_Delay_Init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+
+  DWT->CYCCNT = 0U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+static void delay_us(uint32_t us)
+{
+  uint32_t start_tick;
+  uint32_t delay_ticks;
+
+  start_tick = DWT->CYCCNT;
+  delay_ticks = us * (SystemCoreClock / 1000000U);
+
+  while ((DWT->CYCCNT - start_tick) < delay_ticks)
+  {
+  }
+}
+static uint32_t DWT_ElapsedUs(uint32_t start_cycle)
+{
+  uint32_t elapsed_cycles;
+
+  elapsed_cycles = DWT->CYCCNT - start_cycle;
+
+  return elapsed_cycles /
+         (SystemCoreClock / 1000000U);
+}
+
+static uint32_t DWT_BetweenUs(uint32_t start_cycle,
+                              uint32_t end_cycle)
+{
+  uint32_t elapsed_cycles;
+
+  elapsed_cycles = end_cycle - start_cycle;
+
+  return elapsed_cycles /
+         (SystemCoreClock / 1000000U);
+}
+/* PA8 / TIM1_CH1 38 kHz carrier */
+static void IR_CarrierOn(void)
+{
+  __HAL_TIM_SET_COMPARE(&htim1,
+                        TIM_CHANNEL_1,
+                        IR_PWM_DUTY);
+}
+
+static void IR_CarrierOff(void)
+{
+  __HAL_TIM_SET_COMPARE(&htim1,
+                        TIM_CHANNEL_1,
+                        0U);
+}
+
+static void IR_SendStart(void)
+{
+  IR_CarrierOn();
+  delay_us(IR_START_ON_US);
+
+  IR_CarrierOff();
+  delay_us(IR_START_OFF_US);
+}
+
+static void IR_SendBit(uint8_t bitValue)
+{
+  IR_CarrierOn();
+  delay_us(IR_BIT_MARK_US);
+
+  IR_CarrierOff();
+
+  if (bitValue != 0U)
+  {
+    delay_us(IR_ONE_SPACE_US);
+  }
+  else
+  {
+    delay_us(IR_ZERO_SPACE_US);
+  }
+}
+
+static void IR_SendStop(void)
+{
+  IR_CarrierOn();
+  delay_us(IR_STOP_MARK_US);
+
+  IR_CarrierOff();
+}
+static void LCD_UpdateEvent(uint8_t event_type, uint8_t level)
+{
+  uint32_t lcd_start_cycle;
+
+  /*
+   * 預設這次沒有重新更新 LCD。
+   * 如果相同畫面直接 return，LCD 時間會是 0。
+   */
+  timing_lcd_us = 0U;
+
+  /*
+   * 狀態相同就不重新繪圖，避免 LCD 閃爍。
+   */
+  if ((lcd_last_event_type == event_type) &&
+      (lcd_last_level == level))
+  {
+    return;
+  }
+
+  lcd_last_event_type = event_type;
+  lcd_last_level = level;
+
+  /*
+   * 開始測量整張畫面的更新時間。
+   */
+  lcd_start_cycle = DWT->CYCCNT;
+
+  if (event_type == IR_TYPE_ERROR)
+  {
+    LCD_ShowSystemErrorScreen();
+  }
+  else if ((event_type == IR_TYPE_NONE) &&
+           (level == IR_LEVEL_NONE))
+  {
+    LCD_ShowSafeScreen();
+  }
+  else if ((event_type == IR_TYPE_VRU_CROSS) &&
+           (level == IR_LEVEL_1))
+  {
+    LCD_ShowLevel1Screen();
+  }
+  else if ((event_type == IR_TYPE_VRU_CROSS) &&
+           (level == IR_LEVEL_2))
+  {
+    LCD_ShowLevel2Screen();
+  }
+  else if ((event_type == IR_TYPE_VRU_CROSS) &&
+           (level == IR_LEVEL_3))
+  {
+    LCD_ShowLevel3Screen();
+  }
+  else if ((event_type == IR_TYPE_BRAKE) &&
+          (level == IR_LEVEL_1))
+  {
+    LCD_ShowBrakeLevel1Screen();
+  }
+  else if ((event_type == IR_TYPE_BRAKE) &&
+           (level == IR_LEVEL_2))
+  {
+    LCD_ShowBrakeLevel2Screen();
+  }
+  else if ((event_type == IR_TYPE_BRAKE) &&
+          (level == IR_LEVEL_3))
+  {
+    LCD_ShowBrakeLevel3Screen();
+  }
+  else
+  {
+    LCD_ShowSystemErrorScreen();
+  }
+
+  /*
+   * 畫面函式執行結束後，SPI 資料已經傳送完成。
+   */
+  timing_lcd_us =
+      DWT_ElapsedUs(lcd_start_cycle);
+}
+/*
+ * Payload：
+ *
+ * TTT LL CCC
+ *
+ * TTT：event type
+ * LL ：warning level
+ * CCC：TTT XOR 0LL
+ */
+/*
+ * CRC-2 生成多項式：
+ *
+ * G(x) = x^2 + x + 1
+ * 二進位表示為 111，也就是 0x07。
+ *
+ * 傳入資料格式：
+ * TTLL，共4 bit。
+ *
+ * 回傳：
+ * 2 bit CRC。
+ */
+static uint8_t IR_CalculateCRC2(uint8_t data4)
+{
+  uint8_t remainder;
+  int8_t bit;
+
+  /*
+   * 只保留低4 bit，並在後面補2個0。
+   *
+   * 例如：
+   * data4 = 0110
+   * remainder = 011000
+   */
+  remainder = (uint8_t)((data4 & 0x0FU) << 2);
+
+  /*
+   * 使用 111 做模二除法。
+   * 模二除法中的減法就是 XOR。
+   */
+  for (bit = 5; bit >= 2; bit--)
+  {
+    if ((remainder & (1U << bit)) != 0U)
+    {
+      remainder ^= (uint8_t)(0x07U << (bit - 2));
+    }
+  }
+
+  /*
+   * 最後只保留2 bit餘數。
+   */
+  return remainder & 0x03U;
+}
+
+/*
+ * 6-bit Payload：
+ *
+ * TT LL CC
+ *
+ * TT：事件種類，2 bit
+ * LL：事件等級，2 bit
+ * CC：CRC-2，2 bit
+ */
+static uint8_t IR_MakePayload(uint8_t event_type,
+                              uint8_t level)
+{
+  uint8_t data4;
+  uint8_t crc2;
+
+  /*
+   * 將事件種類與等級組成4 bit：
+   *
+   * TTLL
+   */
+  data4 = (uint8_t)(((event_type & 0x03U) << 2) |
+                     (level & 0x03U));
+
+  crc2 = IR_CalculateCRC2(data4);
+
+  /*
+   * 組成：
+   *
+   * TTLLCC
+   */
+  return (uint8_t)((data4 << 2) | crc2);
+}
+
+/*
+ * 6-bit Payload，MSB first。
+ *
+ * 傳送順序：
+ * bit5 → bit4 → bit3 → bit2 → bit1 → bit0
+ */
+static void IR_SendPayload6(uint8_t payload)
+{
+  int8_t i;
+
+  payload &= 0x3FU;
+
+  for (i = 5; i >= 0; i--)
+  {
+    IR_SendBit((payload >> i) & 0x01U);
+  }
+}
+
+static void IR_SendCurrentEvent(void)
+{
+  uint8_t payload;
+  uint32_t ir_start_cycle;
+  uint8_t is_first_tx;
+
+  payload = IR_MakePayload(current_event_type,
+                           current_level);
+
+  is_first_tx = timing_first_tx_pending;
+
+  /*
+   * 新事件第一包發送前，開啟 PC9 EXTI。
+   * PC9 必須以跳線接到 PA8，才能量到「實際 PWM 第一個上升緣」。
+   */
+  if (is_first_tx != 0U)
+  {
+    timing_ir_tx_start_cycle = 0U;
+    timing_ir_wait_us = 0U;
+    timing_stm32_to_ir_us = 0U;
+    timing_nano_done_to_ir_us = 0U;
+    timing_nano_start_to_ir_us = 0U;
+    timing_ir_monitor_armed = 1U;
+
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
+    EXTI->IMR |= GPIO_PIN_9;
+  }
+
+  /* 量測一包完整 6-bit IR 的軟體執行時間 */
+  ir_start_cycle = DWT->CYCCNT;
+
+  IR_SendStart();
+  IR_SendPayload6(payload);
+  IR_SendStop();
+  IR_CarrierOff();
+
+  timing_ir_tx_us = DWT_ElapsedUs(ir_start_cycle);
+
+  if (is_first_tx != 0U)
+  {
+    timing_first_tx_pending = 0U;
+
+    /*
+     * 若 PC9 沒有接線或 EXTI 未設定，避免量測旗標一直保持開啟。
+     * 此時與實際 IR 起始相關的數值會維持 0。
+     */
+    if (timing_ir_monitor_armed != 0U)
+    {
+      timing_ir_monitor_armed = 0U;
+      EXTI->IMR &= ~GPIO_PIN_9;
+    }
+  }
+}
+/* 計時結果輸出 */
+static void Timing_PrintResult(uint8_t event_type,
+                               uint8_t level)
+{
+  char log_msg[520];
+  uint8_t payload;
+
+  payload = IR_MakePayload(event_type, level);
+  timing_sequence++;
+
+  /*
+   * 所有時間都已在 IR、LCD 完成前記錄完畢，
+   * 因此現在才透過 UART4 印出，不會污染本次量測。
+   */
+  snprintf(
+      log_msg,
+      sizeof(log_msg),
+      "TIME,SEQ=%lu,CODE=0x%02X,TYPE=%u,LEVEL=%u,PAYLOAD=0x%02X,"
+      "MARK=%u,NANO_INFER=%lu us,NANO_TO_UART=%lu us,"
+      "UART_TO_PROCESS=%lu us,PROCESS_TO_IR=%lu us,UART_TO_IR=%lu us,"
+      "NANO_DONE_TO_IR=%lu us,NANO_START_TO_IR=%lu us,"
+      "IR_TX=%lu us,LCD=%lu us,PROCESS_TO_LCD=%lu us,"
+      "UART_TO_LCD=%lu us,NANO_DONE_TO_LCD=%lu us,"
+      "NANO_START_TO_LCD=%lu us,DROPPED=%lu\r\n",
+      (unsigned long)timing_sequence,
+      (unsigned int)timing_rx_code,
+      (unsigned int)event_type,
+      (unsigned int)level,
+      (unsigned int)payload,
+      (unsigned int)timing_nano_mark_valid,
+      (unsigned long)timing_nano_inference_us,
+      (unsigned long)timing_nano_to_uart_us,
+      (unsigned long)timing_uart_to_process_us,
+      (unsigned long)timing_ir_wait_us,
+      (unsigned long)timing_stm32_to_ir_us,
+      (unsigned long)timing_nano_done_to_ir_us,
+      (unsigned long)timing_nano_start_to_ir_us,
+      (unsigned long)timing_ir_tx_us,
+      (unsigned long)timing_lcd_us,
+      (unsigned long)timing_total_to_lcd_us,
+      (unsigned long)timing_uart_to_lcd_us,
+      (unsigned long)timing_nano_done_to_lcd_us,
+      (unsigned long)timing_nano_start_to_lcd_us,
+      (unsigned long)nano_dropped_count
+  );
+
+  UART_Print(log_msg);
+
+  /* 只清除目前事件快照，不動 PC8 的下一組最新標記 */
+  timing_uart_event_valid = 0U;
+  timing_nano_mark_valid = 0U;
+}
+
+static void Set_Event(uint8_t event_type,
+                      uint8_t level)
+{
+  uint32_t lcd_done_cycle;
+
+  timing_event_start_cycle = DWT->CYCCNT;
+
+  /* 清除上一筆結果 */
+  timing_nano_inference_us = 0U;
+  timing_nano_to_uart_us = 0U;
+  timing_uart_to_process_us = 0U;
+  timing_ir_wait_us = 0U;
+  timing_stm32_to_ir_us = 0U;
+  timing_nano_done_to_ir_us = 0U;
+  timing_nano_start_to_ir_us = 0U;
+  timing_ir_tx_us = 0U;
+  timing_lcd_us = 0U;
+  timing_total_to_lcd_us = 0U;
+  timing_uart_to_lcd_us = 0U;
+  timing_nano_done_to_lcd_us = 0U;
+  timing_nano_start_to_lcd_us = 0U;
+
+  if (timing_uart_event_valid != 0U)
+  {
+    timing_uart_to_process_us =
+        DWT_BetweenUs(timing_uart_done_cycle,
+                      timing_event_start_cycle);
+  }
+
+  if (timing_nano_mark_valid != 0U)
+  {
+    timing_nano_inference_us =
+        DWT_BetweenUs(timing_nano_start_cycle,
+                      timing_nano_done_cycle);
+
+    timing_nano_to_uart_us =
+        DWT_BetweenUs(timing_nano_done_cycle,
+                      timing_uart_done_cycle);
+  }
+
+  timing_first_tx_pending = 1U;
+
+  current_event_type = event_type;
+  current_level = level;
+
+  force_send_now = 1U;
+  last_send_tick = HAL_GetTick();
+
+  /* 先發 IR，再更新前車 LCD */
+  IR_Process();
+  LCD_UpdateEvent(event_type, level);
+
+  lcd_done_cycle = DWT->CYCCNT;
+
+  timing_total_to_lcd_us =
+      DWT_BetweenUs(timing_event_start_cycle,
+                    lcd_done_cycle);
+
+  if (timing_uart_event_valid != 0U)
+  {
+    timing_uart_to_lcd_us =
+        DWT_BetweenUs(timing_uart_done_cycle,
+                      lcd_done_cycle);
+  }
+
+  if (timing_nano_mark_valid != 0U)
+  {
+    timing_nano_done_to_lcd_us =
+        DWT_BetweenUs(timing_nano_done_cycle,
+                      lcd_done_cycle);
+
+    timing_nano_start_to_lcd_us =
+        DWT_BetweenUs(timing_nano_start_cycle,
+                      lcd_done_cycle);
+  }
+
+  Timing_PrintResult(event_type, level);
+}
+
+static void Process_Nano_Event(void)
+{
+  uint8_t rx_data;
+  uint32_t uart_cycle;
+  uint32_t nano_start_cycle;
+  uint32_t nano_done_cycle;
+  uint8_t marker_valid;
+
+  if (nano_event_pending == 0U)
+  {
+    return;
+  }
+
+  /* 很短暫地關閉中斷，完整取出 ISR 快照 */
+  __disable_irq();
+
+  rx_data = nano_pending_code;
+  uart_cycle = nano_pending_uart_cycle;
+  nano_start_cycle = nano_pending_start_cycle;
+  nano_done_cycle = nano_pending_done_cycle;
+  marker_valid = nano_pending_marker_valid;
+  nano_event_pending = 0U;
+
+  __enable_irq();
+
+  timing_rx_code = rx_data;
+  timing_uart_done_cycle = uart_cycle;
+  timing_nano_start_cycle = nano_start_cycle;
+  timing_nano_done_cycle = nano_done_cycle;
+  timing_uart_event_valid = 1U;
+  timing_nano_mark_valid = marker_valid;
+
+  switch (rx_data)
+  {
+    case NANO_CODE_SAFE:
+      Set_Event(IR_TYPE_NONE,
+                IR_LEVEL_NONE);
+      break;
+
+    case NANO_CODE_LEVEL_1:
+      Set_Event(IR_TYPE_VRU_CROSS,
+                IR_LEVEL_1);
+      break;
+
+    case NANO_CODE_LEVEL_2:
+      Set_Event(IR_TYPE_VRU_CROSS,
+                IR_LEVEL_2);
+      break;
+
+    case NANO_CODE_LEVEL_3:
+      Set_Event(IR_TYPE_VRU_CROSS,
+                IR_LEVEL_3);
+      break;
+
+    default:
+    {
+      char invalid_msg[64];
+
+      snprintf(invalid_msg,
+               sizeof(invalid_msg),
+               "Invalid Nano event code: 0x%02X\r\n",
+               (unsigned int)rx_data);
+      UART_Print(invalid_msg);
+
+      timing_uart_event_valid = 0U;
+      timing_nano_mark_valid = 0U;
+      break;
+    }
+  }
+}
+
+static void IR_Process(void)
+{
+  uint32_t now;
+  uint32_t period_ms;
+
+  now = HAL_GetTick();
+
+  /*
+ * SAFE 狀態：
+ * 每隔固定時間持續發送 00000000，
+ * 直到目前狀態改變。
+ */
+if ((current_event_type == IR_TYPE_NONE) &&
+    (current_level == IR_LEVEL_NONE))
+{
+  if ((force_send_now != 0U) ||
+      ((now - last_send_tick) >= IR_SAFE_PERIOD_MS))
+  {
+    IR_SendCurrentEvent();
+
+    last_send_tick = now;
+    force_send_now = 0U;
+
+    //UART_Print("TX SAFE 00000000\r\n");
+  }
+
+  return;
+}
+
+  /*
+   * 系統錯誤每 300 ms 發送一次；
+   * 一般事件每 150 ms 發送一次。
+   */
+  if (current_event_type == IR_TYPE_ERROR)
+  {
+    period_ms = IR_ERROR_PERIOD_MS;
+  }
+  else
+  {
+    period_ms = IR_EVENT_PERIOD_MS;
+  }
+
+  if ((force_send_now != 0U) ||
+      ((now - last_send_tick) >= period_ms))
+  {
+    IR_SendCurrentEvent();
+
+    last_send_tick = now;
+    force_send_now = 0U;
+  }
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_I2C1_Init();
+  MX_SPI2_Init();
+  MX_TIM1_Init();
+  MX_UART4_Init();
+  MX_USART2_UART_Init();
+  MX_USB_HOST_Init();
+  /* USER CODE BEGIN 2 */
+
+/*
+ * 能進入這裡，代表前面的 GPIO、DMA、I2C、SPI、
+ * TIM1、UART4、USART2、USB Host 初始化都已返回。
+ */
+UART_Print("\r\nBOOT 1: Enter USER CODE 2\r\n");
+
+/*
+ * 等待 LCD 電源及控制器穩定。
+ */
+UART_Print("BOOT 2: Before LCD init\r\n");
+
+HAL_Delay(1000);
+
+ILI9341_Init();
+HAL_Delay(100);
+
+UART_Print("BOOT 3: LCD init OK\r\n");
+
+/*
+ * 初始化 DWT 微秒計時器。
+ */
+DWT_Delay_Init();
+
+UART_Print("BOOT 4: DWT init OK\r\n");
+
+/*
+ * USART2 改用接收完成中斷，完整收到 1 Byte 時立即打時間戳。
+ * CubeMX 必須開啟 USART2 global interrupt。
+ */
+if (HAL_UART_Receive_IT(&huart2,
+                        &nano_rx_byte,
+                        1U) != HAL_OK)
+{
+  Error_Handler();
+}
+
+UART_Print("BOOT 4-1: USART2 RX interrupt armed\r\n");
+
+/*
+ * PC9 只在新事件第一包發送前才開啟。
+ * 開機先關閉 EXTI9 並清除中斷旗標。
+ */
+EXTI->IMR &= ~GPIO_PIN_9;
+__HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
+
+UART_Print("BOOT 5: EXTI9 setup OK\r\n");
+
+/*
+ * 準備啟動 TIM1 Channel 1 PWM。
+ */
+UART_Print("BOOT 6: Before TIM1 PWM start\r\n");
+
+if (HAL_TIM_PWM_Start(&htim1,
+                      TIM_CHANNEL_1) != HAL_OK)
+{
+  Error_Handler();
+}
+
+UART_Print("BOOT 7: TIM1 PWM start OK\r\n");
+
+/*
+ * 開機預設先關閉紅外線載波。
+ */
+IR_CarrierOff();
+
+UART_Print("BOOT 8: IR carrier OFF\r\n");
+
+/*
+ * 準備建立初始 SAFE 狀態。
+ * Set_Event() 裡面會：
+ * 1. 發送第一包 SAFE IR
+ * 2. 更新 LCD SAFE 畫面
+ * 3. 輸出 TIME 紀錄
+ */
+UART_Print("BOOT 9: Before initial SAFE\r\n");
+
+Set_Event(IR_TYPE_NONE,
+          IR_LEVEL_NONE);
+
+UART_Print("BOOT 10: Initial SAFE OK\r\n");
+
+/*
+ * 所有初始化完成。
+ */
+UART_Print("\r\nLCD + IR TX Ready\r\n");
+UART_Print("USART2 interrupt waiting for Nano event byte\r\n");
+UART_Print("0x00 = SAFE\r\n");
+UART_Print("0x05 = VRU Level 1\r\n");
+UART_Print("0x06 = VRU Level 2\r\n");
+UART_Print("0x07 = VRU Level 3\r\n");
+
+/* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+{
+    /* USER CODE END WHILE */
+    MX_USB_HOST_Process();
+
+    /* USER CODE BEGIN 3 */
+
+  /*
+   * 處理 USART2 中斷已收到的 Nano 事件。
+   */
+  Process_Nano_Event();
+
+  /*
+   * 根據目前狀態發送紅外線。
+   */
+  IR_Process();
+
+  /*
+   * 避免主迴圈跑得過快。
+   */
+  HAL_Delay(IR_MAIN_LOOP_DELAY_MS);
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USART2 完整收到一個 Nano Byte 時立即記錄 DWT 時間 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  uint32_t now_cycle;
+
+  if (huart->Instance != USART2)
+  {
+    return;
+  }
+
+  now_cycle = DWT->CYCCNT;
+
+  if (nano_event_pending == 0U)
+  {
+    nano_pending_code = nano_rx_byte;
+    nano_pending_uart_cycle = now_cycle;
+
+    /* 把 PC8 這一組標記與 UART Byte 綁在一起 */
+    nano_pending_start_cycle = nano_marker_start_cycle;
+    nano_pending_done_cycle = nano_marker_done_cycle;
+    nano_pending_marker_valid = nano_marker_valid;
+
+    nano_event_pending = 1U;
+  }
+  else
+  {
+    /* 主程式尚未處理上一筆，這筆不覆蓋，僅記錄遺失次數 */
+    nano_dropped_count++;
+  }
+
+  /* 立刻準備接收下一個 Byte */
+  (void)HAL_UART_Receive_IT(&huart2,
+                            &nano_rx_byte,
+                            1U);
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance != USART2)
+  {
+    return;
+  }
+
+  /* 清除 overrun，重新啟動一個 Byte 的中斷接收 */
+  __HAL_UART_CLEAR_OREFLAG(huart);
+
+  (void)HAL_UART_Receive_IT(&huart2,
+                            &nano_rx_byte,
+                            1U);
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  uint32_t now_cycle;
+
+  now_cycle = DWT->CYCCNT;
+
+  /* PC8：Nano 辨識開始／完成標記，使用雙邊緣中斷 */
+  if (GPIO_Pin == GPIO_PIN_8)
+  {
+    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_8) == GPIO_PIN_SET)
+    {
+      /* 上升緣：Nano 開始辨識 */
+      nano_marker_start_cycle = now_cycle;
+      nano_marker_valid = 0U;
+    }
+    else
+    {
+      /* 下降緣：Nano 完成判定，下一步應立即送 USART2 */
+      nano_marker_done_cycle = now_cycle;
+      nano_marker_valid = 1U;
+    }
+
+    return;
+  }
+
+  /* PC9：監看 PA8，只抓新事件第一包的第一個 PWM 上升緣 */
+  if (GPIO_Pin == GPIO_PIN_9)
+  {
+    if (timing_ir_monitor_armed != 0U)
+    {
+      timing_ir_tx_start_cycle = now_cycle;
+
+      timing_ir_wait_us =
+          DWT_BetweenUs(timing_event_start_cycle,
+                        timing_ir_tx_start_cycle);
+
+      if (timing_uart_event_valid != 0U)
+      {
+        timing_stm32_to_ir_us =
+            DWT_BetweenUs(timing_uart_done_cycle,
+                          timing_ir_tx_start_cycle);
+      }
+
+      if (timing_nano_mark_valid != 0U)
+      {
+        timing_nano_done_to_ir_us =
+            DWT_BetweenUs(timing_nano_done_cycle,
+                          timing_ir_tx_start_cycle);
+
+        timing_nano_start_to_ir_us =
+            DWT_BetweenUs(timing_nano_start_cycle,
+                          timing_ir_tx_start_cycle);
+      }
+
+      timing_ir_monitor_armed = 0U;
+
+      /* 取得第一個邊緣後關閉 EXTI9，避免 38 kHz 持續進中斷 */
+      EXTI->IMR &= ~GPIO_PIN_9;
+    }
+
+    return;
+  }
+}
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
